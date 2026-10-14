@@ -243,7 +243,7 @@ async def h():
     seller, performance, ai = FakeSeller(), FakePerformance(), FakeAI()
     bot = Bot("123456:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO", session=telegram)
     app = BotApp(
-        Settings(bot.token, "postgresql://unused", "shared-ai-test-key"),
+        Settings(bot.token, "unused-test.sqlite3", "shared-ai-test-key"),
         storage,
         seller_factory=seller,
         performance_factory=performance,

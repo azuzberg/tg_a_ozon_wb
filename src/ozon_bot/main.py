@@ -2,39 +2,31 @@ import asyncio
 import logging
 
 from aiogram import Bot
+from aiogram.utils.token import TokenValidationError
 
 from .bot import BotApp, create_dispatcher
-from .config import Settings
+from .config import Settings, SettingsError
 from .network import EnvironmentSession
-from .storage import Storage
+from .storage import Storage, StorageError
 
 
 async def run() -> None:
     settings = Settings.load()
-    storage = Storage(settings.database_url)
+    storage = Storage(settings.database_path)
     bot = Bot(settings.telegram_token, session=EnvironmentSession())
     app = None
     cleaner = None
-    watcher = None
     try:
         await storage.open()
         app = BotApp(settings, storage)
         dispatcher = create_dispatcher(app)
         cleaner = asyncio.create_task(app.sweep(bot))
-        owner = asyncio.current_task()
-
-        async def watch_database_lock() -> None:
-            await storage.wait_lock_lost()
-            logging.getLogger(__name__).error("PostgreSQL session lock lost; stopping bot.")
-            owner.cancel()
-
-        watcher = asyncio.create_task(watch_database_lock())
         # Long polling: веб-сервер и webhook не используются.
         # Старые updates могут содержать ключи от предыдущего сеанса.
         await bot.delete_webhook(drop_pending_updates=True)
         await dispatcher.start_polling(bot, close_bot_session=False)
     finally:
-        tasks = [task for task in (cleaner, watcher) if task is not None]
+        tasks = [cleaner] if cleaner is not None else []
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -58,6 +50,12 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     except asyncio.CancelledError:
+        raise SystemExit(1) from None
+    except (SettingsError, StorageError) as error:
+        logging.error("%s", error)
+        raise SystemExit(1) from None
+    except TokenValidationError:
+        logging.error("Проверьте TELEGRAM_BOT_TOKEN в .env: нужен токен от BotFather.")
         raise SystemExit(1) from None
     except Exception as error:
         logging.error(

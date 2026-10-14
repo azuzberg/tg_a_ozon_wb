@@ -1,129 +1,128 @@
-"""PostgreSQL storage for expiring metadata and imported data, without API keys."""
+"""Local SQLite storage for expiring metadata and imports, without API keys."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import math
+import sqlite3
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from uuid import UUID
 
-import asyncpg
+import aiosqlite
+from filelock import FileLock, Timeout
 
 from .imports import normalize_rows
 
-_LOCK_ID = 0x4F5A4F4E424F5401
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS ozon_bot_sessions (
-    session_id UUID PRIMARY KEY,
-    user_id BIGINT NOT NULL UNIQUE,
-    chat_id BIGINT NOT NULL,
-    name TEXT NOT NULL CHECK (char_length(name) BETWEEN 1 AND 120),
-    expires_at TIMESTAMPTZ NOT NULL,
-    tax_rate NUMERIC(7,4) NOT NULL DEFAULT 6 CHECK (tax_rate BETWEEN 0 AND 100),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    session_id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL UNIQUE,
+    chat_id INTEGER NOT NULL,
+    name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 120),
+    expires_at REAL NOT NULL,
+    tax_rate REAL NOT NULL DEFAULT 6 CHECK (tax_rate BETWEEN 0 AND 100),
+    created_at REAL NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS REAL))
 );
 CREATE INDEX IF NOT EXISTS ozon_bot_sessions_expires_idx
     ON ozon_bot_sessions (expires_at);
 CREATE TABLE IF NOT EXISTS ozon_bot_imports (
-    session_id UUID NOT NULL REFERENCES ozon_bot_sessions(session_id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES ozon_bot_sessions(session_id) ON DELETE CASCADE,
     kind TEXT NOT NULL CHECK (kind IN ('costs', 'ads', 'seo', 'competitors')),
-    payload JSONB NOT NULL CHECK (jsonb_typeof(payload) = 'array'),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    payload TEXT NOT NULL CHECK (json_valid(payload) AND json_type(payload) = 'array'),
+    updated_at REAL NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS REAL)),
     PRIMARY KEY (session_id, kind)
 );
 """
 
 
-class Storage:
-    """One bot instance per database; credentials exist only in the caller's RAM.
+class StorageError(RuntimeError):
+    """A startup or ownership error whose message is safe to show to the user."""
 
-    A dedicated PostgreSQL connection holds the advisory lock. On a successful
-    restart all previous session metadata and imports are removed, since their
-    in-memory API keys cannot be restored.
+
+class Storage:
+    """One bot instance per SQLite file; API credentials stay in the caller's RAM.
+
+    A portable OS file lock is held for the lifetime of the connection. Only its
+    owner may clear old sessions on startup, because their in-memory keys cannot
+    be restored. All operations share an asyncio lock to keep transactions apart.
     """
 
-    def __init__(self, database_url: str) -> None:
-        self._database_url = database_url
-        self._pool: asyncpg.Pool | None = None
-        self._lock_connection: asyncpg.Connection | None = None
-        self._lock_lost = asyncio.Event()
-        self._closing = False
+    def __init__(self, database_path: str | Path) -> None:
+        self.database_path = Path(database_path).expanduser().resolve()
+        self._file_lock = FileLock(f"{self.database_path}.lock", thread_local=False)
+        self._operation_lock = asyncio.Lock()
+        self._connection: aiosqlite.Connection | None = None
 
-    @property
-    def lock_lost(self) -> bool:
-        return self._lock_lost.is_set()
-
-    async def wait_lock_lost(self) -> None:
-        """Wake a shutdown watchdog when the lock connection unexpectedly ends."""
-        await self._lock_lost.wait()
-
-    def _on_lock_terminated(self, connection: asyncpg.Connection) -> None:
-        if not self._closing and self._lock_connection is connection:
-            self._lock_lost.set()
-
-    @property
-    def pool(self) -> asyncpg.Pool:
-        if (
-            self._lock_connection is not None
-            and self._lock_connection.is_closed()
-            and not self._closing
-        ):
-            # A connection can report closed before its queued termination
-            # callback runs. Refuse work during that interval as well.
-            self._lock_lost.set()
-        if self.lock_lost:
-            raise RuntimeError("Соединение блокировки PostgreSQL потеряно. Перезапустите бота.")
-        if self._pool is None:
-            raise RuntimeError("Соединение с PostgreSQL ещё не открыто.")
-        return self._pool
+    def _require_connection(self) -> aiosqlite.Connection:
+        if self._connection is None:
+            raise StorageError("Соединение с SQLite ещё не открыто.")
+        return self._connection
 
     async def open(self) -> None:
-        if self._pool is not None:
-            if self.lock_lost or self._lock_connection is None or self._lock_connection.is_closed():
-                self._lock_lost.set()
-                raise RuntimeError("Соединение блокировки PostgreSQL потеряно. Перезапустите бота.")
-            return
-        self._closing = False
-        self._lock_lost.clear()
-        connection = await asyncpg.connect(self._database_url, command_timeout=30)
-        try:
-            locked = await connection.fetchval("SELECT pg_try_advisory_lock($1::bigint)", _LOCK_ID)
-            if not locked:
-                raise RuntimeError("Другой экземпляр бота уже использует эту базу данных.")
-            self._lock_connection = connection
-            connection.add_termination_listener(self._on_lock_terminated)
-            async with connection.transaction():
-                await connection.execute(_SCHEMA)
-                await connection.execute("DELETE FROM ozon_bot_sessions")
-            pool = await asyncpg.create_pool(
-                self._database_url, min_size=1, max_size=5, command_timeout=30
-            )
-            if connection.is_closed() or self.lock_lost:
-                await pool.close()
-                raise RuntimeError("Соединение блокировки PostgreSQL потеряно во время запуска.")
-            self._pool = pool
-        except BaseException:
-            connection.remove_termination_listener(self._on_lock_terminated)
-            if self._lock_connection is connection:
-                self._lock_connection = None
-            await connection.close()
-            raise
+        async with self._operation_lock:
+            if self._connection is not None:
+                return
+            try:
+                self.database_path.parent.mkdir(parents=True, exist_ok=True)
+                self._file_lock.acquire(timeout=0)
+            except Timeout as exc:
+                raise StorageError("Другой экземпляр бота уже использует эту базу данных.") from exc
+            except OSError as exc:
+                raise StorageError(
+                    "Не удалось создать файл SQLite. Проверьте DB_PATH и права на папку."
+                ) from exc
+            connection: aiosqlite.Connection | None = None
+            try:
+                connection = await aiosqlite.connect(self.database_path, isolation_level=None)
+                for pragma in (
+                    "PRAGMA foreign_keys = ON",
+                    "PRAGMA busy_timeout = 5000",
+                    "PRAGMA journal_mode = WAL",
+                ):
+                    async with connection.execute(pragma):
+                        pass
+                async with _transaction(connection):
+                    # executescript implicitly commits an existing transaction.
+                    # Execute the fixed schema statements individually instead.
+                    for statement in _SCHEMA.split(";"):
+                        if statement.strip():
+                            async with connection.execute(statement):
+                                pass
+                    async with connection.execute("DELETE FROM ozon_bot_sessions"):
+                        pass
+                self._connection = connection
+            except BaseException as exc:
+                try:
+                    if connection is not None:
+                        await connection.close()
+                finally:
+                    self._file_lock.release()
+                if isinstance(exc, (sqlite3.Error, OSError)):
+                    raise StorageError(
+                        "Не удалось открыть SQLite. Проверьте DB_PATH и права на папку."
+                    ) from exc
+                raise
 
     async def close(self) -> None:
-        self._closing = True
-        pool, self._pool = self._pool, None
-        connection, self._lock_connection = self._lock_connection, None
-        if connection is not None:
-            connection.remove_termination_listener(self._on_lock_terminated)
-        try:
-            if pool is not None:
-                await pool.close()
-        finally:
-            if connection is not None:
-                # PostgreSQL releases all advisory locks when their owning
-                # connection closes, including a connection already lost.
-                await connection.close()
+        async with self._operation_lock:
+            connection, self._connection = self._connection, None
+            try:
+                if connection is not None:
+                    await connection.close()
+            finally:
+                self._file_lock.release()
+
+    async def _write(self, sql: str, parameters: tuple, *, require_session: bool = False) -> None:
+        async with self._operation_lock:
+            connection = self._require_connection()
+            async with _transaction(connection):
+                async with connection.execute(sql, parameters) as cursor:
+                    if require_session and cursor.rowcount == 0:
+                        raise ValueError("Сеанс уже завершён.")
 
     async def create_session(
         self,
@@ -133,73 +132,99 @@ class Storage:
         name: str,
         expires_at: datetime,
     ) -> None:
-        _aware(expires_at)
-        await self.pool.execute(
+        await self._write(
             """INSERT INTO ozon_bot_sessions
                (session_id, user_id, chat_id, name, expires_at)
-               VALUES ($1, $2, $3, $4, $5)""",
-            UUID(session_id),
-            user_id,
-            chat_id,
-            name.strip(),
-            expires_at,
+               VALUES (?, ?, ?, ?, ?)""",
+            (str(UUID(session_id)), user_id, chat_id, name.strip(), _timestamp(expires_at)),
         )
 
     async def delete_session(self, session_id: str) -> None:
-        # Foreign-key cascade makes metadata and imports disappear atomically.
-        await self.pool.execute(
-            "DELETE FROM ozon_bot_sessions WHERE session_id = $1", UUID(session_id)
+        # Foreign-key cascade removes metadata and imports in one transaction.
+        await self._write(
+            "DELETE FROM ozon_bot_sessions WHERE session_id = ?", (str(UUID(session_id)),)
         )
 
     async def set_tax(self, session_id: str, rate: float) -> None:
         if isinstance(rate, bool) or not math.isfinite(rate) or not 0 <= rate <= 100:
             raise ValueError("Налоговая ставка должна быть от 0 до 100 процентов.")
-        result = await self.pool.execute(
-            "UPDATE ozon_bot_sessions SET tax_rate = $2 WHERE session_id = $1",
-            UUID(session_id),
-            rate,
+        await self._write(
+            "UPDATE ozon_bot_sessions SET tax_rate = ? WHERE session_id = ?",
+            (rate, str(UUID(session_id))),
+            require_session=True,
         )
-        if result == "UPDATE 0":
-            raise ValueError("Сеанс уже завершён.")
 
     async def save_import(self, session_id: str, kind: str, rows: list[dict]) -> None:
         clean_rows = normalize_rows(kind, rows)
         payload = json.dumps(clean_rows, ensure_ascii=False, allow_nan=False)
-        await self.pool.execute(
+        await self._write(
             """INSERT INTO ozon_bot_imports (session_id, kind, payload)
-               VALUES ($1, $2, $3::jsonb)
+               VALUES (?, ?, ?)
                ON CONFLICT (session_id, kind)
-               DO UPDATE SET payload = EXCLUDED.payload, updated_at = CURRENT_TIMESTAMP""",
-            UUID(session_id),
-            kind,
-            payload,
+               DO UPDATE SET payload = excluded.payload,
+                   updated_at = CAST(strftime('%s', 'now') AS REAL)""",
+            (str(UUID(session_id)), kind, payload),
         )
 
     async def load_imports(self, session_id: str) -> dict[str, list[dict]]:
-        records = await self.pool.fetch(
-            "SELECT kind, payload FROM ozon_bot_imports WHERE session_id = $1",
-            UUID(session_id),
-        )
-        return {record["kind"]: json.loads(record["payload"]) for record in records}
+        canonical_id = str(UUID(session_id))
+        async with self._operation_lock:
+            connection = self._require_connection()
+            async with connection.execute(
+                "SELECT kind, payload FROM ozon_bot_imports WHERE session_id = ?",
+                (canonical_id,),
+            ) as cursor:
+                records = await cursor.fetchall()
+        return {kind: json.loads(payload) for kind, payload in records}
 
     async def expire_sessions(self, now: datetime) -> list[str]:
-        _aware(now)
-        records = await self.pool.fetch(
-            "DELETE FROM ozon_bot_sessions WHERE expires_at <= $1 RETURNING session_id", now
-        )
-        return [str(record["session_id"]) for record in records]
+        timestamp = _timestamp(now)
+        async with self._operation_lock:
+            connection = self._require_connection()
+            async with _transaction(connection):
+                async with connection.execute(
+                    "SELECT session_id FROM ozon_bot_sessions WHERE expires_at <= ?",
+                    (timestamp,),
+                ) as cursor:
+                    records = await cursor.fetchall()
+                async with connection.execute(
+                    "DELETE FROM ozon_bot_sessions WHERE expires_at <= ?", (timestamp,)
+                ):
+                    pass
+        return [session_id for (session_id,) in records]
 
     async def touch(self, session_id: str, expires_at: datetime) -> None:
-        _aware(expires_at)
-        result = await self.pool.execute(
-            "UPDATE ozon_bot_sessions SET expires_at = $2 WHERE session_id = $1",
-            UUID(session_id),
-            expires_at,
+        await self._write(
+            "UPDATE ozon_bot_sessions SET expires_at = ? WHERE session_id = ?",
+            (_timestamp(expires_at), str(UUID(session_id))),
+            require_session=True,
         )
-        if result == "UPDATE 0":
-            raise ValueError("Сеанс уже завершён.")
 
 
-def _aware(value: datetime) -> None:
+@asynccontextmanager
+async def _transaction(connection: aiosqlite.Connection) -> AsyncIterator[None]:
+    try:
+        async with connection.execute("BEGIN IMMEDIATE"):
+            pass
+        yield
+        await connection.commit()
+    except BaseException:
+        # aiosqlite queues SQL on a worker thread. Cancelling a waiting BEGIN
+        # does not remove it from that queue: rollback must run afterwards and
+        # finish before another coroutine can acquire the operation lock.
+        rollback = asyncio.create_task(connection.rollback())
+        while True:
+            try:
+                await asyncio.shield(rollback)
+                break
+            except asyncio.CancelledError:
+                if rollback.cancelled():
+                    raise
+        raise
+
+
+def _timestamp(value: datetime) -> float:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("Время сеанса должно включать часовой пояс.")
+    # Numeric UTC epochs compare instants correctly regardless of offset.
+    return value.timestamp()
