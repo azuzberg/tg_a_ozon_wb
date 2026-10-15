@@ -1,6 +1,6 @@
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -10,12 +10,15 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import AnswerCallbackQuery, DeleteMessage, GetFile, SendDocument, SendMessage
 from aiogram.types import CallbackQuery, Chat, Document, File, Message, Update, User
 
+from ozon_bot.ai import ClaudeError
 from ozon_bot.bot import BotApp, create_dispatcher, parse_period
 from ozon_bot.config import Settings
 from ozon_bot.domain import Snapshot
 from ozon_bot.imports import SAMPLE_CSV
 from ozon_bot.ozon import OzonAPIError
 from ozon_bot.performance import PerformanceAPIError
+from ozon_bot.wildberries import WildberriesError
+from ozon_bot.wildberries_ads import WildberriesAdsError
 
 
 class RecordingTelegram(BaseSession):
@@ -28,6 +31,9 @@ class RecordingTelegram(BaseSession):
         self.fail_delete = False
         self.delete_started = asyncio.Event()
         self.release_delete = None
+        self.fail_text_once = None
+        self.fail_document_once = False
+        self.delivered = []
 
     async def close(self):
         pass
@@ -51,6 +57,17 @@ class RecordingTelegram(BaseSession):
                 file_path="imports/upload.csv",
             )
         if isinstance(method, (SendMessage, SendDocument)):
+            if isinstance(method, SendDocument) and self.fail_document_once:
+                self.fail_document_once = False
+                raise TelegramBadRequest(method=method, message="document delivery rejected")
+            if (
+                isinstance(method, SendMessage)
+                and self.fail_text_once is not None
+                and self.fail_text_once in method.text
+            ):
+                self.fail_text_once = None
+                raise TelegramBadRequest(method=method, message="message is too long")
+            self.delivered.append(method)
             return Message(
                 message_id=len(self.calls),
                 date=datetime.now(UTC),
@@ -166,10 +183,41 @@ class FakePerformance:
 class FakeAI:
     def __init__(self):
         self.facts = []
+        self.answer = "Проверьте комиссии и себестоимость."
+        self.error = None
 
     async def advise(self, facts):
         self.facts.append(facts)
-        return "Проверьте комиссии и себестоимость."
+        if self.error is not None:
+            raise self.error
+        return self.answer
+
+
+class FakeWildberries(FakeSeller):
+    def __call__(self, api_key):
+        self.credentials.append(api_key)
+        return self
+
+    async def validate(self):
+        if self.reject:
+            self.validations += 1
+            raise WildberriesError("Wildberries отклонил доступ.")
+        await super().validate()
+
+    async def load(self, start, end):
+        snapshot = await super().load(start, end)
+        snapshot.marketplace = "wildberries"
+        return snapshot
+
+
+class FakeWildberriesAds(FakePerformance):
+    def __call__(self, api_key):
+        self.credentials.append(api_key)
+        return self
+
+    async def validate(self):
+        if self.reject:
+            raise WildberriesAdsError("Нет доступа к рекламе Wildberries.")
 
 
 @dataclass
@@ -182,6 +230,8 @@ class Harness:
     seller: FakeSeller
     performance: FakePerformance
     ai: FakeAI
+    wildberries: FakeWildberries
+    wildberries_ads: FakeWildberriesAds
     update_id: int = 0
 
     async def text(self, text, *, user_id=101, chat_id=None, chat_type="private"):
@@ -214,8 +264,21 @@ class Harness:
             self.bot, Update(update_id=self.update_id, callback_query=query)
         )
 
-    async def login(self, *, user_id=101):
-        for value in ("/start", "Алексей", "123456", "seller-test-secret"):
+    async def begin_login(self, *, user_id=101, marketplace="ozon"):
+        await self.text("/start", user_id=user_id)
+        await self.callback(f"marketplace:{marketplace}", user_id=user_id)
+
+    async def login(self, *, user_id=101, marketplace="ozon"):
+        await self.begin_login(user_id=user_id, marketplace=marketplace)
+        values = (
+            ("Алексей", "123456", "seller-test-secret")
+            if marketplace == "ozon"
+            else (
+                "Алексей",
+                "wb-seller-test-secret",
+            )
+        )
+        for value in values:
             await self.text(value, user_id=user_id)
         return self.app.sessions[user_id]
 
@@ -241,15 +304,29 @@ class Harness:
 async def h():
     telegram, storage = RecordingTelegram(), FakeStorage()
     seller, performance, ai = FakeSeller(), FakePerformance(), FakeAI()
+    wildberries, wildberries_ads = FakeWildberries(), FakeWildberriesAds()
     bot = Bot("123456:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO", session=telegram)
     app = BotApp(
         Settings(bot.token, "unused-test.sqlite3", "shared-ai-test-key"),
         storage,
         seller_factory=seller,
         performance_factory=performance,
+        wildberries_factory=wildberries,
+        wildberries_ads_factory=wildberries_ads,
         ai_client=ai,
     )
-    harness = Harness(app, create_dispatcher(app), bot, telegram, storage, seller, performance, ai)
+    harness = Harness(
+        app,
+        create_dispatcher(app),
+        bot,
+        telegram,
+        storage,
+        seller,
+        performance,
+        ai,
+        wildberries,
+        wildberries_ads,
+    )
     yield harness
     for user_id in list(app.sessions):
         await app.end(user_id)
@@ -260,7 +337,7 @@ async def test_menu_gated_until_validated_login_and_keys_do_not_enter_database(h
     await h.callback("report:finance")
     assert "Сначала" in h.telegram.messages[-1].text
     assert h.seller.loads == 0
-    await h.text("/start")
+    await h.begin_login()
     await h.text("Алексей")
     await h.text("123456")
     assert not h.app.sessions
@@ -276,7 +353,7 @@ async def test_menu_gated_until_validated_login_and_keys_do_not_enter_database(h
     session = h.app.sessions[101]
     assert session.api_key == "seller-test-secret"
     assert h.telegram.messages[-1].reply_markup
-    assert "выберите анализ" in h.telegram.messages[-1].text
+    assert "выберите анализ" in h.telegram.messages[-1].text.lower()
     assert len(h.storage.created) == 1
     assert h.storage.created[0][1:4] == (101, 101, "Алексей")
     assert "seller-test-secret" not in repr(h.storage.created)
@@ -297,8 +374,95 @@ async def test_group_messages_and_callbacks_cannot_login_or_dispatch_analysis(h)
     assert h.seller.loads == 0
 
 
+async def test_start_requires_button_selection_and_marketplace_cannot_change_mid_login(h):
+    await h.text("/start")
+    assert h.app.pending[101].step == "marketplace"
+    actions = {
+        button.callback_data
+        for row in h.telegram.messages[-1].reply_markup.inline_keyboard
+        for button in row
+    }
+    assert {"marketplace:ozon", "marketplace:wildberries"} <= actions
+    await h.text("Алексей")
+    await h.callback("marketplace:untrusted-provider")
+    assert h.app.pending[101].step == "marketplace"
+    assert not h.seller.credentials and not h.wildberries.credentials
+    await h.callback("marketplace:wildberries")
+    assert h.app.pending[101].step == "name"
+    await h.callback("marketplace:ozon")
+    await h.text("Алексей")
+    assert h.app.pending[101].step == "api_key"
+    await h.text("wb-seller-test-secret")
+    assert h.app.sessions[101].marketplace == "wildberries"
+    assert h.wildberries.credentials == ["wb-seller-test-secret"]
+    assert not h.seller.credentials
+
+
+async def test_wildberries_single_key_login_routes_reports_and_ads_to_wb_factories_only(h):
+    session = await h.login(marketplace="wildberries")
+    assert session.marketplace == "wildberries"
+    assert session.client_id == ""
+    assert session.api_key == "wb-seller-test-secret"
+    assert h.wildberries.validations == 1
+    assert not h.seller.credentials and not h.performance.credentials
+    assert session.api_key not in repr(h.storage.created)
+    await h.callback("report:sales")
+    assert h.wildberries.loads == 1 and h.seller.loads == 0
+    assert session.snapshot.marketplace == "wildberries"
+    assert session.context().snapshot.marketplace == "wildberries"
+    await h.callback("connect_ads")
+    assert session.state == "ads_secret"
+    ads_message = await h.text("wb-ads-test-secret")
+    assert h.wildberries_ads.credentials == ["wb-ads-test-secret"]
+    assert session.performance_secret == "wb-ads-test-secret"
+    assert session.performance_id == ""
+    assert any(
+        isinstance(call, DeleteMessage) and call.message_id == ads_message.message_id
+        for call in h.telegram.calls
+    )
+    await h.callback("report:ads")
+    assert len(h.wildberries_ads.credentials) == 2  # Authentication and report fetch.
+    assert not h.performance.credentials and not h.seller.credentials
+    await h.callback("report:ai")
+    assert h.ai.facts[-1]["marketplace"] == "wildberries"
+    assert session.api_key not in json.dumps(h.ai.facts)
+    assert session.performance_secret not in json.dumps(h.ai.facts)
+    await h.callback("logout")
+    assert session.api_key == session.performance_secret == ""
+    assert not h.app.sessions
+
+
+async def test_restarting_login_for_wb_erases_old_ozon_key_and_never_reuses_it(h):
+    ozon = await h.login()
+    wb = await h.login(marketplace="wildberries")
+    assert ozon.api_key == ""
+    assert h.storage.deleted == [ozon.id]
+    assert wb.marketplace == "wildberries"
+    assert h.wildberries.credentials == ["wb-seller-test-secret"]
+    assert h.seller.credentials == [("123456", "seller-test-secret")]
+    await h.callback("marketplace:ozon")
+    assert h.app.sessions[101] is wb
+    assert wb.marketplace == "wildberries"
+
+
+async def test_rejected_wb_auth_never_activates_session_or_routes_key_to_ozon(h):
+    await h.begin_login(marketplace="wildberries")
+    await h.text("Алексей")
+    h.wildberries.reject = True
+    await h.text("rejected-wb-test-secret")
+    assert not h.app.sessions and not h.storage.created
+    assert h.app.pending[101].step == "api_key"
+    assert not h.seller.credentials
+    h.wildberries.reject = False
+    await h.text("accepted-wb-test-secret")
+    assert h.app.sessions[101].api_key == "accepted-wb-test-secret"
+    assert h.app.sessions[101].marketplace == "wildberries"
+    assert not h.seller.credentials
+
+
 async def test_credential_deletion_failure_informs_user_without_echoing_secret(h):
-    for value in ("/start", "Алексей", "123456"):
+    await h.begin_login()
+    for value in ("Алексей", "123456"):
         await h.text(value)
     h.telegram.fail_delete = True
     await h.text("seller-test-secret")
@@ -308,7 +472,8 @@ async def test_credential_deletion_failure_informs_user_without_echoing_secret(h
 
 
 async def test_second_login_secret_is_deleted_while_first_is_being_validated(h):
-    for value in ("/start", "Алексей", "123456"):
+    await h.begin_login()
+    for value in ("Алексей", "123456"):
         await h.text(value)
     h.seller.release_validate = asyncio.Event()
     first_task = asyncio.create_task(h.text("first-seller-test-secret"))
@@ -559,13 +724,176 @@ async def test_ai_dispatch_sends_business_summary_and_no_credentials_or_identity
     assert "Совет ИИ" in h.telegram.messages[-1].text
 
 
+async def test_successful_ai_answer_is_reused_until_facts_or_model_change(h):
+    session = await h.login()
+    await h.callback("report:ai")
+    assert len(h.ai.facts) == 1
+    assert session.ai_answer == h.ai.answer
+    assert session.ai_digest
+    await h.callback("report:ai")
+    assert len(h.ai.facts) == 1
+    assert h.ai.answer in h.telegram.messages[-1].text
+    await h.callback("tax:0")
+    await h.callback("report:ai")
+    assert len(h.ai.facts) == 2
+    h.app.settings = replace(h.app.settings, claude_model="different-test-model")
+    await h.callback("report:ai")
+    assert len(h.ai.facts) == 3
+
+
+async def test_ai_failure_cooldown_avoids_repeat_charge_and_explicit_retry_is_available(h):
+    session = await h.login()
+    h.ai.error = ClaudeError("Claude не ответил; проверьте историю запросов.")
+    await h.callback("report:ai")
+    assert len(h.ai.facts) == 1
+    assert session.ai_last_error
+    await h.callback("report:ai")
+    assert len(h.ai.facts) == 1
+    assert any(
+        button.callback_data == "ai_retry"
+        for message in h.telegram.messages
+        if message.reply_markup is not None
+        for row in message.reply_markup.inline_keyboard
+        for button in row
+    )
+    h.ai.error = None
+    await h.callback("ai_retry")
+    assert len(h.ai.facts) == 2
+    assert session.ai_answer == h.ai.answer
+    assert h.ai.answer in h.telegram.messages[-1].text
+
+
+async def test_explicit_ai_retry_replaces_successful_cached_answer_once(h):
+    session = await h.login()
+    await h.callback("report:ai")
+    old_answer = session.ai_answer
+    h.ai.answer = "Новый ответ после явного платного повтора."
+    await h.callback("report:ai")
+    assert len(h.ai.facts) == 1 and session.ai_answer == old_answer
+    await h.callback("ai_retry")
+    assert len(h.ai.facts) == 2 and session.ai_answer == h.ai.answer
+    await h.callback("report:ai")
+    assert len(h.ai.facts) == 2
+    assert h.ai.answer in h.telegram.messages[-1].text
+
+
+async def test_failed_forced_ai_request_preserves_previous_successful_answer_and_digest(h):
+    session = await h.login()
+    await h.callback("report:ai")
+    saved_answer = session.ai_answer
+    saved_digest = session.ai_answer_digest
+    assert saved_answer and saved_digest
+    await h.callback("tax:0")  # The attempted replacement has different facts.
+    h.ai.error = ClaudeError("Новый платный запрос не завершился.")
+    await h.callback("ai_retry")
+    assert len(h.ai.facts) == 2
+    assert session.ai_last_error
+    assert session.ai_digest != saved_digest
+    assert session.ai_answer == saved_answer
+    assert session.ai_answer_digest == saved_digest
+    await h.callback("ai_cached")
+    assert saved_answer in h.telegram.messages[-1].text
+    assert len(h.ai.facts) == 2
+
+
+async def test_ai_cached_restores_old_answer_without_loading_changed_period_or_ads(h):
+    session = await h.login()
+    await h.callback("connect_ads")
+    await h.text("performance-client")
+    await h.text("performance-test-secret")
+    await h.callback("report:ai")
+    saved_answer = session.ai_answer
+    seller_requests = list(h.seller.credentials)
+    ads_requests = list(h.performance.credentials)
+    old_period = session.period
+    await h.callback("days:7")
+    assert session.period != old_period and session.snapshot is None
+    assert session.ads_period != session.period
+    await asyncio.wait_for(h.callback("ai_cached"), 2)
+    assert saved_answer in h.telegram.messages[-1].text
+    assert session.snapshot is None
+    assert h.seller.credentials == seller_requests
+    assert h.performance.credentials == ads_requests
+    assert len(h.ai.facts) == 1
+
+
+async def test_ai_cache_is_separate_for_each_authenticated_user(h):
+    first = await h.login(user_id=101)
+    second = await h.login(user_id=202)
+    h.ai.answer = "Совет первому магазину."
+    await h.callback("report:ai", user_id=101)
+    h.ai.answer = "Совет второму магазину."
+    await h.callback("report:ai", user_id=202)
+    assert len(h.ai.facts) == 2
+    assert first.ai_answer == "Совет первому магазину."
+    assert second.ai_answer == "Совет второму магазину."
+    await h.callback("report:ai", user_id=101)
+    assert len(h.ai.facts) == 2
+    assert first.ai_answer in h.telegram.messages[-1].text
+
+
+async def test_paid_ai_answer_survives_telegram_delivery_failure_without_new_model_call(h):
+    session = await h.login()
+    h.ai.answer = "Готовый платный совет: проверьте остатки и логистику."
+    h.telegram.fail_text_once = h.ai.answer
+    await h.callback("report:ai")
+    assert len(h.ai.facts) == 1
+    assert session.ai_answer == h.ai.answer
+    fallback = [
+        call
+        for call in h.telegram.delivered
+        if isinstance(call, SendDocument) and call.document.filename == "ai_advice.txt"
+    ]
+    if fallback:
+        assert h.ai.answer in fallback[-1].document.data.decode("utf-8")
+    await h.callback("report:ai")
+    assert len(h.ai.facts) == 1
+    assert any(
+        isinstance(call, SendMessage) and h.ai.answer in call.text for call in h.telegram.delivered
+    )
+    await h.callback("logout")
+    assert not session.ai_answer and not session.ai_digest and not session.ai_last_error
+    assert not session.ai_answer_digest
+
+
+async def test_ai_answer_can_be_redelivered_without_charge_after_text_and_document_fail(h):
+    session = await h.login()
+    h.ai.answer = "Сохранённый ответ после двух ошибок Telegram."
+    h.telegram.fail_text_once = h.ai.answer
+    h.telegram.fail_document_once = True
+    await h.callback("report:ai")
+    assert session.ai_answer == h.ai.answer and len(h.ai.facts) == 1
+    assert not any(
+        isinstance(call, SendMessage) and h.ai.answer in call.text for call in h.telegram.delivered
+    )
+    await h.callback("report:ai")
+    assert len(h.ai.facts) == 1
+    assert h.ai.answer in h.telegram.messages[-1].text
+
+
+async def test_ai_answer_long_emoji_delivery_respects_telegram_utf16_limits(h):
+    await h.login()
+    h.ai.answer = "🧠" * 5000 + "<план>" + "🙂" * 400
+    await h.callback("report:ai")
+    pieces = [
+        call
+        for call in h.telegram.delivered
+        if isinstance(call, SendMessage) and ("🧠" in call.text or "🙂" in call.text)
+    ]
+    assert len(pieces) >= 3
+    assert all(len(call.text.encode("utf-16-le")) // 2 <= 4096 for call in pieces)
+    assert all(call.parse_mode is None for call in pieces)
+    assert "".join(call.text for call in pieces).removeprefix("Совет ИИ\n\n") == h.ai.answer
+    assert len(h.ai.facts) == 1
+
+
 async def test_start_replaces_session_and_erases_previous_key(h):
     old = await h.login()
     await h.text("/start")
     assert old.api_key == ""
     assert h.storage.deleted == [old.id]
     assert not h.app.sessions
-    assert h.app.pending[101].step == "name"
+    assert h.app.pending[101].step == "marketplace"
 
 
 @pytest.mark.parametrize(

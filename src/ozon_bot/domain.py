@@ -29,6 +29,10 @@ class Snapshot:
     stocks: list[dict[str, Any]] = field(default_factory=list)
     daily: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    marketplace: str = "ozon"
+    sales: list[dict[str, Any]] = field(default_factory=list)
+    sources: dict[str, Any] = field(default_factory=dict)
+    sales_available: bool = False
 
 
 @dataclass

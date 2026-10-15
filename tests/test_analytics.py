@@ -11,6 +11,12 @@ def context(**kwargs):
         key: kwargs.pop(key, [])
         for key in ("transactions", "postings", "products", "stocks", "daily", "warnings")
     }
+    snapshot_fields.update(
+        marketplace=kwargs.pop("marketplace", "ozon"),
+        sales=kwargs.pop("sales", []),
+        sources=kwargs.pop("sources", {}),
+        sales_available=kwargs.pop("sales_available", False),
+    )
     return AnalysisContext(
         snapshot=Snapshot(**snapshot_fields),
         period=Period(date(2026, 1, 1), date(2026, 1, 30), "январь"),
@@ -258,3 +264,296 @@ def test_competitor_latest_observation_and_price_comparison():
 )
 def test_empty_sources_are_explicitly_unavailable(kind):
     assert not build_report(kind, context()).facts["available"]
+
+
+@pytest.mark.parametrize("marketplace", ["wb", "wildberries"])
+def test_wb_sales_use_actual_event_dates_and_do_not_invent_basket_checks(marketplace):
+    report = build_report(
+        "sales",
+        context(
+            marketplace=marketplace,
+            sources={"sales": True, "orders": True},
+            postings=[posting("a", "unknown"), posting("b", "cancelled", sku=2)],
+            products=[{"sku": 1, "category": "Посуда"}],
+            sales=[
+                {
+                    "sale_id": "S1",
+                    "date": "2026-01-15",
+                    "sku": 1,
+                    "quantity": 2,
+                    "price": 100,
+                    "status": "delivered",
+                },
+                {
+                    "sale_id": "R1",
+                    "date": "2026-01-18",
+                    "sku": 1,
+                    "quantity": 1,
+                    "price": 100,
+                    "status": "returned",
+                },
+                {
+                    "sale_id": "old",
+                    "date": "2025-12-31",
+                    "sku": 1,
+                    "quantity": 10,
+                    "price": 100,
+                    "status": "delivered",
+                },
+            ],
+        ),
+    )
+    assert report.facts["orders"] == 2
+    assert report.facts["cancelled_orders"] == 1
+    assert report.facts["delivered_units"] == 2
+    assert report.facts["returned_units"] == 1
+    assert report.facts["delivered_value"] == 200
+    assert report.facts["average_basket"] is None
+    assert report.facts["average_unit_price"] == 100
+    daily = {row["date"]: row for row in report.facts["daily"]}
+    assert daily["2026-01-15"]["delivered_units"] == 2
+    assert daily["2026-01-15"]["orders"] == 0
+    assert daily["2026-01-18"]["returned_units"] == 1
+    assert "Ozon" not in report.text
+
+
+def test_wb_unavailable_sales_do_not_become_zero_buyouts_or_returns():
+    report = build_report(
+        "sales",
+        context(
+            marketplace="wb",
+            sources={"sales": False, "orders": True},
+            postings=[posting("a", "unknown")],
+        ),
+    )
+    assert report.facts["orders"] == 1
+    assert report.facts["delivered_units"] is None
+    assert report.facts["returned_units"] is None
+    assert report.facts["delivered_value"] is None
+    assert not report.facts["sales_complete"]
+
+
+def test_wb_successfully_loaded_empty_sales_are_true_zeroes():
+    report = build_report(
+        "sales", context(marketplace="wb", sources={"sales": True, "orders": True})
+    )
+    assert report.facts["available"]
+    assert report.facts["orders"] == 0
+    assert report.facts["delivered_units"] == 0
+    assert report.facts["returned_units"] == 0
+    assert report.facts["average_unit_price"] is None
+
+
+def test_wb_missing_sale_price_does_not_become_zero_revenue():
+    ctx = context(
+        marketplace="wildberries",
+        sources={"sales": True, "orders": False},
+        sales=[
+            {
+                "sale_id": "S1",
+                "date": "2026-01-15",
+                "sku": 1,
+                "quantity": 1,
+                "price": None,
+                "status": "delivered",
+            }
+        ],
+    )
+    sales = build_report("sales", ctx).facts
+    assert sales["delivered_units"] == 1
+    assert sales["delivered_value"] is None
+    assert sales["average_unit_price"] is None
+    assert sales["orders"] is None
+    categories = build_report("categories", ctx).facts
+    assert categories["categories"][0]["buyouts"] == 1
+    assert categories["categories"][0]["buyout_revenue"] is None
+    assert categories["buyout_revenue"] is None
+
+
+def test_wb_finance_reconciles_signed_payout_and_never_subtracts_fees_twice():
+    ctx = context(
+        marketplace="wb",
+        sources={"finance": True},
+        costs={"1": 100},
+        transactions=[
+            {
+                "amount": 730,
+                "accruals_for_sale": 1000,
+                "sale_commission": -150,
+                "items": [{"sku": 1, "quantity": 2}],
+                "services": [
+                    {"name": "Логистика WB", "price": -70},
+                    {"name": "Хранение", "price": -20},
+                ],
+            },
+            {
+                "amount": -360,
+                "accruals_for_sale": -500,
+                "sale_commission": 75,
+                "items": [{"sku": 1, "quantity": 1}],
+                "services": [{"name": "Логистика WB", "price": 35}],
+            },
+        ],
+    )
+    report = build_report("finance", ctx)
+    assert report.facts["ledger_net"] == 370
+    assert report.facts["revenue"] == 500
+    assert report.facts["commission"] == 75
+    assert report.facts["logistics"] == 35
+    assert report.facts["other"] == 20
+    assert report.facts["cogs"] == 100
+    assert report.facts["profit"] == 240
+    assert "Итог операций Wildberries" in report.text
+    assert "Ozon" not in report.text
+    ctx.snapshot.transactions[0]["incomplete"] = True
+    incomplete = build_report("finance", ctx).facts
+    assert incomplete["profit"] is None
+    assert incomplete["estimated_profit"] is None
+    assert incomplete["cogs"] is None
+
+
+def test_wb_stocks_keep_available_quantity_and_do_not_treat_transit_as_reserves():
+    report = build_report(
+        "stocks",
+        context(
+            marketplace="wb",
+            sources={"sales": True},
+            stocks=[
+                {
+                    "sku": 1,
+                    "present": 10,
+                    "reserved": 4,
+                    "reserved_known": False,
+                    "inWayToClient": 9,
+                    "inWayFromClient": 5,
+                }
+            ],
+            sales=[
+                {
+                    "sale_id": "S1",
+                    "date": "2026-01-15",
+                    "sku": 1,
+                    "quantity": 6,
+                    "price": 100,
+                    "status": "delivered",
+                },
+                {
+                    "sale_id": "R1",
+                    "date": "2026-01-16",
+                    "sku": 1,
+                    "quantity": 2,
+                    "price": 100,
+                    "status": "returned",
+                },
+            ],
+        ),
+    )
+    product = report.facts["products"][0]
+    assert product["available"] == 10
+    assert product["sold_units"] == 4
+    assert product["days_cover"] == 75
+    assert product["reserved"] is None
+    assert report.facts["reserved_units"] is None
+    assert report.facts["excess_count"] == 1
+
+
+def test_wb_stock_forecast_is_unavailable_without_complete_sales_source():
+    report = build_report(
+        "stocks",
+        context(
+            marketplace="wb",
+            sources={"sales": False},
+            stocks=[{"sku": 1, "present": 10, "reserved_known": False}],
+        ),
+    )
+    product = report.facts["products"][0]
+    assert product["available"] == 10
+    assert product["daily_demand"] is None
+    assert product["recommended_supply"] is None
+    assert report.facts["shortage_count"] is None
+    assert report.facts["excess_count"] is None
+
+
+def test_wb_category_pages_separate_orders_from_realized_sale_events():
+    products = [{"sku": i, "category": f"Категория {i}"} for i in range(1, 11)]
+    sales = [
+        {
+            "sale_id": f"S{i}",
+            "date": "2026-01-20",
+            "sku": i,
+            "quantity": 2,
+            "price": 100,
+            "status": "delivered",
+        }
+        for i in range(1, 11)
+    ]
+    sales.append(
+        {
+            "sale_id": "R1",
+            "date": "2026-01-21",
+            "sku": 1,
+            "quantity": 1,
+            "price": 100,
+            "status": "returned",
+        }
+    )
+    ctx = context(
+        marketplace="wb",
+        sources={"sales": True, "orders": True},
+        products=products,
+        postings=[posting(str(i), "unknown", sku=i) for i in range(1, 11)],
+        sales=sales,
+    )
+    first = build_report("categories", ctx)
+    second = build_report("categories", ctx, page=1)
+    assert first.facts["pages"] == 2
+    assert len(first.facts["page_categories"]) == 8
+    assert len(second.facts["page_categories"]) == 2
+    rows = {row["category"]: row for row in first.facts["categories"]}
+    assert rows["Категория 1"]["orders"] == 1
+    assert rows["Категория 1"]["buyouts"] == 2
+    assert rows["Категория 1"]["returns"] == 1
+    assert rows["Категория 1"]["net_realized_turnover"] == 100
+    assert first.facts["buyout_revenue"] == 2000
+    assert first.facts["net_realized_turnover"] == 1900
+
+
+def test_wb_category_buyouts_remain_unknown_when_sales_source_is_unavailable():
+    report = build_report(
+        "categories",
+        context(
+            marketplace="wb",
+            sources={"orders": True, "sales": False},
+            products=[{"sku": 1, "category": "Посуда"}],
+            postings=[posting("a", "unknown")],
+        ),
+    )
+    row = report.facts["categories"][0]
+    assert row["orders"] == 1
+    assert row["buyouts"] is None
+    assert row["returns"] is None
+    assert row["buyout_revenue"] is None
+    assert report.facts["buyout_revenue"] is None
+
+
+def test_wb_seo_does_not_score_unavailable_content_as_empty_cards():
+    ctx = context(
+        marketplace="wildberries",
+        sources={"products": False},
+        products=[
+            {"sku": 1, "name": "", "category": "Посуда"},
+            {"sku": 2, "name": "", "category": "Посуда"},
+        ],
+    )
+    missing = build_report("seo", ctx)
+    assert not missing.facts["available"]
+    assert "«Контент»" in missing.text
+    assert "нет названия" not in missing.text
+    ctx.seo = [{"sku": "1", "title": "Кружка керамическая с ручкой 350 мл"}]
+    imported = build_report("seo", ctx)
+    assert imported.facts["available"]
+    assert imported.facts["card_count"] == 1
+    assert imported.facts["audit_source"] == "csv_only"
+    assert imported.facts["products"][0]["sku"] == "1"
+    assert imported.facts["products"][0]["description_known"] is False
+    assert "нет названия" not in imported.text

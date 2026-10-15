@@ -9,7 +9,15 @@ from ozon_bot import config
 @pytest.fixture
 def project(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "PROJECT_ROOT", tmp_path)
-    for name in ("TELEGRAM_BOT_TOKEN", "DB_PATH", "CLAUDE_API_KEY", "DATABASE_URL"):
+    for name in (
+        "TELEGRAM_BOT_TOKEN",
+        "DB_PATH",
+        "CLAUDE_API_KEY",
+        "DATABASE_URL",
+        "CLAUDE_MODEL",
+        "CLAUDE_MAX_TOKENS",
+        "CLAUDE_THINKING_MODE",
+    ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("SESSION_TTL_MINUTES", "60")
     return tmp_path
@@ -56,6 +64,18 @@ def test_absolute_database_path_preserved(project, monkeypatch):
 def test_missing_telegram_token_explains_local_env_setup(project):
     with pytest.raises(ValueError, match="TELEGRAM_BOT_TOKEN"):
         config.Settings.load()
+
+
+def test_selected_claude_model_and_budget_are_read_from_pycharm_env(project):
+    (project / ".env").write_text(
+        "TELEGRAM_BOT_TOKEN=test-token\nCLAUDE_MODEL=claude-sonnet-5-5\n"
+        "CLAUDE_MAX_TOKENS=8192\nCLAUDE_THINKING_MODE=disabled\n",
+        encoding="utf-8",
+    )
+    settings = config.Settings.load()
+    assert settings.claude_model == "claude-sonnet-5-5"
+    assert settings.claude_max_tokens == 8192
+    assert settings.claude_thinking_mode == "disabled"
 
 
 def test_root_launcher_imports_sources_when_pycharm_working_directory_differs(

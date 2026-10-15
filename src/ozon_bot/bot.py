@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import logging
 import math
 from dataclasses import dataclass, field
@@ -6,7 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 from io import BytesIO
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BufferedInputFile,
@@ -16,17 +18,22 @@ from aiogram.types import (
     Message,
 )
 
-from .ai import ClaudeClient, ClaudeError
+from .ai import ClaudeClient, ClaudeError, compact
 from .analytics import build_report
 from .config import Settings
+from .delivery import split_telegram_text
 from .domain import Period
 from .imports import MAX_BYTES, SAMPLE_CSV, parse_csv
 from .ozon import OzonAPIError, OzonClient
 from .performance import PerformanceAPIError, PerformanceClient
 from .sessions import Session
 from .storage import Storage
+from .wildberries import WildberriesAPIError as WildberriesError
+from .wildberries import WildberriesClient
+from .wildberries_ads import WildberriesAdsClient, WildberriesAdsError
 
 log = logging.getLogger(__name__)
+MARKETPLACES = {"ozon": "Ozon", "wildberries": "Wildberries"}
 REPORTS = {
     "finance": "💰 Финансы",
     "sales": "📈 Продажи",
@@ -56,6 +63,25 @@ def keyboard(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
 
 def cancel_keyboard() -> InlineKeyboardMarkup:
     return keyboard([[("↩ Меню / отмена ввода", "menu")], [("🚪 Завершить", "logout")]])
+
+
+def marketplace_keyboard() -> InlineKeyboardMarkup:
+    return keyboard(
+        [
+            [(name, f"marketplace:{key}") for key, name in MARKETPLACES.items()],
+            [("🚪 Завершить", "logout")],
+        ]
+    )
+
+
+def ai_keyboard() -> InlineKeyboardMarkup:
+    return keyboard(
+        [
+            [("📄 Последний ответ ИИ", "ai_cached")],
+            [("🔁 Новый запрос ИИ (платный)", "ai_retry")],
+            [("↩ Меню", "menu"), ("🚪 Завершить", "logout")],
+        ]
+    )
 
 
 def main_keyboard() -> InlineKeyboardMarkup:
@@ -89,11 +115,12 @@ def parse_period(text: str) -> Period:
 
 @dataclass
 class Pending:
-    step: str = "name"
+    step: str = "marketplace"
     name: str = ""
     client_id: str = ""
     expires_at: datetime = field(default_factory=lambda: datetime.now(UTC) + timedelta(minutes=10))
     task: asyncio.Task | None = field(default=None, repr=False)
+    marketplace: str = ""
 
 
 class BotApp:
@@ -104,13 +131,22 @@ class BotApp:
         *,
         seller_factory=OzonClient,
         performance_factory=PerformanceClient,
+        wildberries_factory=WildberriesClient,
+        wildberries_ads_factory=WildberriesAdsClient,
         ai_client=None,
     ):
         self.settings = settings
         self.storage = storage
         self.seller_factory = seller_factory
         self.performance_factory = performance_factory
-        self.ai = ai_client or ClaudeClient(settings.claude_api_key, settings.claude_model)
+        self.wildberries_factory = wildberries_factory
+        self.wildberries_ads_factory = wildberries_ads_factory
+        self.ai = ai_client or ClaudeClient(
+            settings.claude_api_key,
+            settings.claude_model,
+            max_tokens=settings.claude_max_tokens,
+            thinking_mode=settings.claude_thinking_mode,
+        )
         self.sessions: dict[int, Session] = {}
         self.pending: dict[int, Pending] = {}
         self.router = Router()
@@ -123,13 +159,14 @@ class BotApp:
         self.router.callback_query.register(self.callback)
 
     async def send(self, bot: Bot, chat_id: int, text: str, markup=None) -> None:
-        # Лимит Telegram применяется к каждому сообщению. Текст API не интерпретируется как HTML.
-        while len(text) > 3600:
-            split = text.rfind("\n", 0, 3600)
-            split = split if split > 100 else 3600
-            await bot.send_message(chat_id, text[:split], parse_mode=None)
-            text = text[split:].lstrip("\n")
-        await bot.send_message(chat_id, text or "Нет данных.", reply_markup=markup, parse_mode=None)
+        chunks = split_telegram_text(text)
+        for index, chunk in enumerate(chunks):
+            await bot.send_message(
+                chat_id,
+                chunk,
+                parse_mode=None,
+                reply_markup=markup if index == len(chunks) - 1 else None,
+            )
 
     async def remove_secret_message(self, message: Message) -> None:
         try:
@@ -169,7 +206,8 @@ class BotApp:
         await self.send(
             bot,
             session.chat_id,
-            f"{session.name}, выберите анализ.\n"
+            f"{session.name}, ваш маркетплейс: {MARKETPLACES[session.marketplace]}.\n"
+            "Выберите анализ.\n"
             f"Период: {session.period.start:%d.%m.%Y} — {session.period.end:%d.%m.%Y}.\n"
             f"Налог: {session.tax_rate:g}% от выручки"
             + (" (предварительно; укажите свою ставку)." if not session.tax_configured else ".")
@@ -181,16 +219,17 @@ class BotApp:
         await self.end(message.from_user.id)
         self.pending[message.from_user.id] = Pending()
         await message.answer(
-            "Здравствуйте! Как к вам обращаться?\n"
-            "Далее понадобятся Client-Id и Api-Key Ozon Seller. Используйте ключ только для чтения. "
+            "Здравствуйте! Выберите маркетплейс.\n"
+            "Используйте ключи только для чтения. "
             "Ключи хранятся только в памяти до завершения сеанса или перезапуска. "
             "Сообщения с ключами бот попробует удалить.",
-            reply_markup=cancel_keyboard(),
+            reply_markup=marketplace_keyboard(),
         )
 
     async def help(self, message: Message) -> None:
         await message.answer(
-            "Вход: /start → имя → Client-Id → Api-Key Ozon Seller. "
+            "Вход: /start → маркетплейс → имя. "
+            "Для Ozon нужны Client-Id и Api-Key, для Wildberries — API-токен продавца. "
             "В меню выбирайте период и раздел кнопками. Себестоимость и внешние данные "
             "загружайте по CSV-шаблонам в настройках. Claude получает сводку только по кнопке "
             "«Совет ИИ»; это передаёт бизнес-показатели Anthropic. "
@@ -240,16 +279,21 @@ class BotApp:
                 )
                 return
             elif session.state == "ads_secret":
-                if not 8 <= len(text) <= 1000:
-                    raise ValueError("Проверьте Client Secret Ozon Performance.")
+                if not 8 <= len(text) <= (4096 if session.marketplace == "wildberries" else 1000):
+                    raise ValueError("Проверьте ключ подключения рекламы.")
                 async with session.lock:
                     if self.sessions.get(user_id) is not session:
                         return
                     session.task = asyncio.current_task()
                     try:
-                        async with self.performance_factory(session.draft["ads_id"], text) as api:
+                        advertising = (
+                            self.wildberries_ads_factory(text)
+                            if session.marketplace == "wildberries"
+                            else self.performance_factory(session.draft["ads_id"], text)
+                        )
+                        async with advertising as api:
                             await api.validate()
-                        session.performance_id = session.draft.pop("ads_id")
+                        session.performance_id = session.draft.pop("ads_id", "")
                         session.performance_secret = text
                         session.ads = []
                         session.ads_source = "api"
@@ -258,7 +302,7 @@ class BotApp:
                     finally:
                         session.task = None
                 await message.answer(
-                    "Реклама подключена. Источник отчётов — Performance API; "
+                    "Реклама подключена. Источник отчётов — рекламный API маркетплейса; "
                     "предыдущий CSV не используется. Данные загрузятся при анализе рекламы."
                 )
             elif session.state and session.state.startswith("import:"):
@@ -269,7 +313,13 @@ class BotApp:
             else:
                 await self.menu(message.bot, session)
                 return
-        except (ValueError, OzonAPIError, PerformanceAPIError) as error:
+        except (
+            ValueError,
+            OzonAPIError,
+            PerformanceAPIError,
+            WildberriesError,
+            WildberriesAdsError,
+        ) as error:
             await message.answer(str(error), reply_markup=cancel_keyboard())
             return
         session.state = None
@@ -289,12 +339,29 @@ class BotApp:
             await message.answer("Проверяю доступ к магазину…")
             return
         text = message.text.strip()
+        if pending.step == "marketplace":
+            await message.answer(
+                "Сначала выберите маркетплейс кнопкой.", reply_markup=marketplace_keyboard()
+            )
+            return
         if pending.step == "name":
             if not 1 <= len(text) <= 120:
                 await message.answer("Имя должно содержать от 1 до 120 символов.")
                 return
-            pending.name, pending.step = text, "client_id"
-            await message.answer("Введите Client-Id Ozon Seller.", reply_markup=cancel_keyboard())
+            pending.name = text
+            if pending.marketplace == "wildberries":
+                pending.step = "api_key"
+                await message.answer(
+                    "Введите API-токен Wildberries. Для полной аналитики нужны категории "
+                    "Статистика, Финансы, Аналитика и Контент. Данные без доступных прав "
+                    "будут отмечены как недоступные.",
+                    reply_markup=cancel_keyboard(),
+                )
+            else:
+                pending.step = "client_id"
+                await message.answer(
+                    "Введите Client-Id Ozon Seller.", reply_markup=cancel_keyboard()
+                )
         elif pending.step == "client_id":
             if not text.isascii() or not text.isdigit() or len(text) > 30:
                 await message.answer("Client-Id должен состоять из цифр.")
@@ -302,14 +369,19 @@ class BotApp:
             pending.client_id, pending.step = text, "api_key"
             await message.answer("Введите Api-Key Ozon Seller.", reply_markup=cancel_keyboard())
         else:
-            if not 8 <= len(text) <= 1000:
-                await message.answer("Проверьте Api-Key (от 8 до 1000 символов).")
+            if not 8 <= len(text) <= (4096 if pending.marketplace == "wildberries" else 1000):
+                await message.answer("Проверьте API-ключ продавца.")
                 return
             pending.task = asyncio.current_task()
             session = None
             registered = False
             try:
-                async with self.seller_factory(pending.client_id, text) as api:
+                seller = (
+                    self.wildberries_factory(text)
+                    if pending.marketplace == "wildberries"
+                    else self.seller_factory(pending.client_id, text)
+                )
+                async with seller as api:
                     await api.validate()
                 session = Session(
                     user_id,
@@ -318,6 +390,7 @@ class BotApp:
                     pending.client_id,
                     text,
                     self.settings.session_ttl_minutes,
+                    marketplace=pending.marketplace,
                 )
                 session.touch()
                 await self.storage.create_session(
@@ -327,7 +400,7 @@ class BotApp:
                 registered = True
                 self.pending.pop(user_id, None)
                 await self.menu(message.bot, session)
-            except OzonAPIError as error:
+            except (OzonAPIError, WildberriesError, ValueError) as error:
                 await message.answer(
                     str(error) + "\nПопробуйте другой Api-Key.", reply_markup=cancel_keyboard()
                 )
@@ -345,6 +418,24 @@ class BotApp:
             await self.end(user_id)
             await query.message.answer(
                 "Сеанс завершён. Ключи и данные сеанса удалены. Для входа /start."
+            )
+            return
+        if action.startswith("marketplace:"):
+            marketplace = action.split(":", 1)[1]
+            pending = self.pending.get(user_id)
+            if marketplace not in MARKETPLACES:
+                return
+            if not pending or pending.step != "marketplace" or pending.task:
+                await query.message.answer("Для смены маркетплейса начните новый сеанс: /start.")
+                return
+            if pending.expires_at <= datetime.now(UTC):
+                await self.end(user_id)
+                await query.message.answer("Время входа истекло. Нажмите /start.")
+                return
+            pending.marketplace, pending.step = marketplace, "name"
+            await query.message.answer(
+                f"Вы выбрали {MARKETPLACES[marketplace]}. Как к вам обращаться?",
+                reply_markup=cancel_keyboard(),
             )
             return
         session = await self.active(user_id, chat_id)
@@ -431,11 +522,21 @@ class BotApp:
                 reply_markup=cancel_keyboard(),
             )
         elif action == "connect_ads":
-            session.state = "ads_id"
-            await query.message.answer(
-                "Введите Client ID из Ozon Performance API (это не Seller Client-Id).",
-                reply_markup=cancel_keyboard(),
-            )
+            session.draft.clear()
+            if session.marketplace == "wildberries":
+                session.state = "ads_secret"
+                await query.message.answer(
+                    "Введите персональный или сервисный токен Wildberries "
+                    "с категорией «Продвижение». "
+                    "Client-Id для него не требуется.",
+                    reply_markup=cancel_keyboard(),
+                )
+            else:
+                session.state = "ads_id"
+                await query.message.answer(
+                    "Введите Client ID из Ozon Performance API (это не Seller Client-Id).",
+                    reply_markup=cancel_keyboard(),
+                )
         elif action == "disconnect_ads":
             session.performance_id, session.performance_secret = "", ""
             if session.ads_source == "api":
@@ -460,6 +561,17 @@ class BotApp:
         elif action.startswith("report:") and action[7:] in REPORTS:
             session.state = None
             await self.run_report(query.bot, session, action[7:])
+        elif action == "ai_retry":
+            session.state = None
+            await self.run_report(query.bot, session, "ai", force_ai=True)
+        elif action == "ai_cached":
+            if session.ai_answer:
+                await self.deliver_ai(query.bot, session)
+            else:
+                await query.message.answer(
+                    "Сохранённого ответа ещё нет. Новый запрос можно отправить кнопкой «Совет ИИ».",
+                    reply_markup=ai_keyboard(),
+                )
         elif action.startswith("category:"):
             try:
                 page = int(action[9:])
@@ -523,7 +635,7 @@ class BotApp:
                 )
                 if kind == "ads":
                     await message.answer(
-                        "Реклама переключена на CSV. Подключение Performance отключено, "
+                        "Реклама переключена на CSV. Подключение рекламного API отключено, "
                         "его ключ удалён из памяти. Новый API-отчёт не перезапишет CSV."
                     )
             except ValueError as error:
@@ -532,7 +644,90 @@ class BotApp:
                 session.task = None
         await self.menu(message.bot, session)
 
-    async def run_report(self, bot: Bot, session: Session, kind: str, page: int = 0) -> None:
+    async def deliver_ai(self, bot: Bot, session: Session) -> None:
+        # Cache is populated before sending. A Telegram failure never regenerates a paid answer.
+        try:
+            await self.send(bot, session.chat_id, "Совет ИИ\n\n" + session.ai_answer, ai_keyboard())
+        except TelegramAPIError as error:
+            log.warning("AI text delivery failed (%s); attempting document", type(error).__name__)
+            try:
+                await bot.send_document(
+                    session.chat_id,
+                    BufferedInputFile(
+                        session.ai_answer.encode("utf-8", errors="replace"),
+                        filename="ai_advice.txt",
+                    ),
+                    caption="Ответ Claude сохранён в файле. Повторного запроса к ИИ не было.",
+                    reply_markup=ai_keyboard(),
+                )
+            except TelegramAPIError as delivery_error:
+                log.warning(
+                    "AI document delivery failed (%s); answer retained in session",
+                    type(delivery_error).__name__,
+                )
+
+    async def advise(self, bot: Bot, session: Session, context, *, force: bool = False) -> None:
+        facts = {
+            "marketplace": session.marketplace,
+            "period": {"start": str(session.period.start), "end": str(session.period.end)},
+            "warnings": list(dict.fromkeys(context.snapshot.warnings)),
+        }
+        for report_kind in REPORTS:
+            if report_kind != "ai":
+                report = await asyncio.to_thread(build_report, report_kind, context)
+                facts[report_kind] = {"facts": report.facts, "notes": report.text}
+        digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "facts": compact(facts),
+                    "model": self.settings.claude_model,
+                    "max_tokens": self.settings.claude_max_tokens,
+                    "thinking_mode": self.settings.claude_thinking_mode,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+            ).encode()
+        ).hexdigest()
+        if not force:
+            if session.ai_answer and session.ai_answer_digest == digest:
+                await self.deliver_ai(bot, session)
+                return
+            if (
+                session.ai_digest == digest
+                and session.ai_last_error
+                and session.ai_attempt_at
+                and datetime.now(UTC) - session.ai_attempt_at < timedelta(seconds=60)
+            ):
+                await self.send(
+                    bot,
+                    session.chat_id,
+                    session.ai_last_error + "\n\nПовторный запрос автоматически не отправлен. "
+                    "Если хотите повторить платный запрос, используйте кнопку ниже.",
+                    ai_keyboard(),
+                )
+                return
+        await self.send(
+            bot, session.chat_id, "Отправляю сводные показатели Claude для рекомендаций."
+        )
+        session.ai_digest, session.ai_last_error = digest, ""
+        session.ai_attempt_at = datetime.now(UTC)
+        try:
+            answer = await self.ai.advise(facts)
+            if not isinstance(answer, str) or not answer.strip():
+                raise ClaudeError("Claude вернул пустой ответ. Автоматического повтора не будет.")
+            session.ai_answer = answer
+            session.ai_answer_digest = digest
+        except ClaudeError as error:
+            session.ai_last_error = str(error)
+            session.ai_attempt_at = datetime.now(UTC)
+            await self.send(bot, session.chat_id, str(error), ai_keyboard())
+            return
+        await self.deliver_ai(bot, session)
+
+    async def run_report(
+        self, bot: Bot, session: Session, kind: str, page: int = 0, *, force_ai: bool = False
+    ) -> None:
         async with session.lock:
             if self.sessions.get(session.user_id) is not session:
                 return
@@ -551,7 +746,12 @@ class BotApp:
                     or session.cache_time is None
                     or now - session.cache_time > timedelta(minutes=5)
                 ):
-                    async with self.seller_factory(session.client_id, session.api_key) as api:
+                    seller = (
+                        self.wildberries_factory(session.api_key)
+                        if session.marketplace == "wildberries"
+                        else self.seller_factory(session.client_id, session.api_key)
+                    )
+                    async with seller as api:
                         session.snapshot = await api.load(session.period.start, session.period.end)
                     session.cache_time = datetime.now(UTC)
                 if kind in ("ads", "ai") and session.performance_secret:
@@ -561,38 +761,26 @@ class BotApp:
                         or now - session.ads_time > timedelta(minutes=5)
                     ):
                         try:
-                            async with self.performance_factory(
-                                session.performance_id, session.performance_secret
-                            ) as api:
+                            advertising = (
+                                self.wildberries_ads_factory(session.performance_secret)
+                                if session.marketplace == "wildberries"
+                                else self.performance_factory(
+                                    session.performance_id, session.performance_secret
+                                )
+                            )
+                            async with advertising as api:
                                 session.ads, warnings = await api.load(
                                     session.period.start, session.period.end
                                 )
                             session.snapshot.warnings.extend(warnings)
                             session.ads_period, session.ads_time = session.period, datetime.now(UTC)
-                        except PerformanceAPIError as error:
+                        except (PerformanceAPIError, WildberriesAdsError) as error:
                             # Старый период рекламы не смешивается с новым отчётом.
                             session.ads = []
                             session.snapshot.warnings.append(f"Реклама недоступна: {error}")
                 context = session.context()
                 if kind == "ai":
-                    facts = {
-                        "period": {
-                            "start": str(session.period.start),
-                            "end": str(session.period.end),
-                        },
-                        "warnings": context.snapshot.warnings,
-                    }
-                    for report_kind in REPORTS:
-                        if report_kind != "ai":
-                            report = await asyncio.to_thread(build_report, report_kind, context)
-                            facts[report_kind] = {"facts": report.facts, "notes": report.text}
-                    await self.send(
-                        bot,
-                        session.chat_id,
-                        "Отправляю сводные показатели Claude для рекомендаций.",
-                    )
-                    answer = await self.ai.advise(facts)
-                    await self.send(bot, session.chat_id, "Совет ИИ\n\n" + answer, main_keyboard())
+                    await self.advise(bot, session, context, force=force_ai)
                 else:
                     report = await asyncio.to_thread(build_report, kind, context, page)
                     markup = main_keyboard()
@@ -615,7 +803,14 @@ class BotApp:
                         f"{session.period.start:%d.%m.%Y} — {session.period.end:%d.%m.%Y}\n\n{report.text}",
                         markup,
                     )
-            except (OzonAPIError, PerformanceAPIError, ClaudeError, ValueError) as error:
+            except (
+                OzonAPIError,
+                PerformanceAPIError,
+                WildberriesError,
+                WildberriesAdsError,
+                ClaudeError,
+                ValueError,
+            ) as error:
                 await self.send(bot, session.chat_id, str(error), main_keyboard())
             finally:
                 session.task = None

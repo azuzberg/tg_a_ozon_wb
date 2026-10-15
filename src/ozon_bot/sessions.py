@@ -34,6 +34,12 @@ class Session:
     task: asyncio.Task | None = field(default=None, repr=False)
     state: str | None = None
     draft: dict[str, str] = field(default_factory=dict, repr=False)
+    marketplace: str = "ozon"
+    ai_digest: str = ""
+    ai_answer: str = field(default="", repr=False)
+    ai_answer_digest: str = ""
+    ai_last_error: str = ""
+    ai_attempt_at: datetime | None = None
 
     def touch(self) -> None:
         self.expires_at = datetime.now(UTC) + timedelta(minutes=self.ttl_minutes)
@@ -73,3 +79,8 @@ class Session:
         self.competitors.clear()
         self.draft.clear()
         self.state = None
+        self.ai_digest = ""
+        self.ai_answer = ""
+        self.ai_answer_digest = ""
+        self.ai_last_error = ""
+        self.ai_attempt_at = None

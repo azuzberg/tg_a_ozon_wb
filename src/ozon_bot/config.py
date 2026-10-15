@@ -21,6 +21,8 @@ class Settings:
     claude_api_key: str
     claude_model: str = "claude-sonnet-4-6"
     session_ttl_minutes: int = 60
+    claude_max_tokens: int = 4096
+    claude_thinking_mode: str = "disabled"
 
     @classmethod
     def load(cls) -> "Settings":
@@ -40,10 +42,23 @@ class Settings:
             ) from None
         if not 5 <= ttl <= 1440:
             raise SettingsError("SESSION_TTL_MINUTES должен быть от 5 до 1440.")
+        try:
+            max_tokens = int(os.getenv("CLAUDE_MAX_TOKENS", "4096"))
+        except ValueError:
+            raise SettingsError(
+                "CLAUDE_MAX_TOKENS должен быть целым числом от 256 до 16384."
+            ) from None
+        if not 256 <= max_tokens <= 16384:
+            raise SettingsError("CLAUDE_MAX_TOKENS должен быть от 256 до 16384.")
+        thinking_mode = os.getenv("CLAUDE_THINKING_MODE", "disabled").strip().lower()
+        if thinking_mode not in ("disabled", "auto"):
+            raise SettingsError("CLAUDE_THINKING_MODE: допустимы disabled и auto.")
         return cls(
             token,
             database.resolve(),
             os.getenv("CLAUDE_API_KEY", "").strip() or CLAUDE_API_KEY,
             os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6"),
             ttl,
+            max_tokens,
+            thinking_mode,
         )

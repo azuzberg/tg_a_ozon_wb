@@ -91,6 +91,23 @@ def _sum(frame: pl.DataFrame, column: str) -> float:
     return float(frame.select(pl.col(column).sum()).item() or 0)
 
 
+def _marketplace(context: AnalysisContext) -> str:
+    return "Wildberries" if _is_wb(context) else "Ozon"
+
+
+def _is_wb(context: AnalysisContext) -> bool:
+    return getattr(context.snapshot, "marketplace", "ozon") in {"wb", "wildberries"}
+
+
+def _source_complete(context: AnalysisContext, kind: str, observed: bool) -> bool:
+    sources = getattr(context.snapshot, "sources", {})
+    if kind in sources:
+        return sources[kind] is True
+    if kind == "sales" and getattr(context.snapshot, "sales_available", False):
+        return True
+    return observed
+
+
 def _report(
     context: AnalysisContext,
     title: str,
@@ -100,6 +117,7 @@ def _report(
 ) -> Report:
     extra = list(dict.fromkeys([*(warnings or []), *context.snapshot.warnings]))
     facts["warnings"] = extra
+    facts["marketplace"] = getattr(context.snapshot, "marketplace", "ozon")
     body = [f"{title} · {context.period.label}", *lines]
     if extra:
         body += ["Ограничения: " + " ".join(extra)]
@@ -206,7 +224,9 @@ def _finance(context: AnalysisContext) -> Report:
     revenue_complete = True
     unknown_units = False
     invalid_inputs = False
+    source_incomplete = not _source_complete(context, "finance", bool(transactions))
     for transaction in transactions:
+        source_incomplete |= bool(transaction.get("incomplete"))
         amount = _num(transaction.get("amount"))
         revenue = _num(transaction.get("accruals_for_sale"))
         commission = _num(transaction.get("sale_commission"))
@@ -280,6 +300,7 @@ def _finance(context: AnalysisContext) -> Report:
         and not unknown_units
         and taxes is not None
         and not invalid_inputs
+        and not source_incomplete
     )
     complete = can_estimate and not quantity_assumed
     estimated_profit = totals["amount"] - totals["cogs"] - taxes if can_estimate else None
@@ -289,7 +310,11 @@ def _finance(context: AnalysisContext) -> Report:
         warnings.append(f"Нет себестоимости {len(missing)} SKU; чистая прибыль не рассчитана.")
     if quantity_assumed:
         warnings.append(
-            "Seller API не передал количество части позиций и сопоставить отправления нельзя: принято 1 шт. только для оценки; точная себестоимость и прибыль недоступны."
+            f"API {_marketplace(context)} не передал количество части позиций и сопоставить отправления нельзя: принято 1 шт. только для оценки; точная себестоимость и прибыль недоступны."
+        )
+    if source_incomplete:
+        warnings.append(
+            "Финансовый отчёт содержит неполные или неоднозначные поля; точная прибыль не рассчитана."
         )
     if unknown_units:
         warnings.append(
@@ -301,7 +326,7 @@ def _finance(context: AnalysisContext) -> Report:
         warnings.append("Налоговая ставка должна быть от 0 до 100%.")
     warnings += [
         "Налог — упрощённая оценка от положительной выручки за вычетом возвратов; налоговый режим и льготы не учтены.",
-        "Прибыль основана на операциях Ozon; внешние расходы и выплаты поставщикам не учтены. Реклама отдельно повторно не вычитается.",
+        f"Прибыль основана на операциях {_marketplace(context)}; внешние расходы и выплаты поставщикам не учтены. Реклама отдельно повторно не вычитается.",
     ]
     if any(row.get("source") == "finance_accrual_by_day" for row in transactions):
         warnings.append(
@@ -321,7 +346,10 @@ def _finance(context: AnalysisContext) -> Report:
         "other": -totals["other"],
         "ledger_net": totals["amount"],
         "cogs": totals["cogs"]
-        if not missing and not unknown_units and not quantity_assumed
+        if not missing
+        and not unknown_units
+        and not quantity_assumed
+        and not (_is_wb(context) and source_incomplete)
         else None,
         "known_cogs": totals["confirmed_cogs"],
         "estimated_cogs": totals["cogs"],
@@ -337,6 +365,7 @@ def _finance(context: AnalysisContext) -> Report:
         ),
         "operation_count": len(rows),
         "ledger_complete": ledger_complete,
+        "source_complete": not source_incomplete,
     }
     lines = [
         f"Продажи: {_money(gross)}; возвраты: {_money(refunds)}",
@@ -344,7 +373,7 @@ def _finance(context: AnalysisContext) -> Report:
         f"Комиссия: {_money(facts['commission'])}",
         f"Логистика: {_money(facts['logistics'])}",
         f"Прочие списания/начисления: {_money(facts['other'])}",
-        f"Итог операций Ozon: {_money(facts['ledger_net'])}",
+        f"Итог операций {_marketplace(context)}: {_money(facts['ledger_net'])}",
         f"Себестоимость: {_money(facts['cogs'])}",
         f"Налог ({context.tax_rate}%): {_money(taxes)}",
         f"Чистая прибыль: {_money(profit)}",
@@ -397,6 +426,7 @@ def _postings(context: AnalysisContext) -> tuple[pl.DataFrame, list[dict], list[
             category = str(
                 product.get("category")
                 or product.get("category_name")
+                or item.get("category")
                 or (
                     f"Категория {product['description_category_id']}"
                     if product.get("description_category_id")
@@ -444,7 +474,179 @@ def _refund_units(context: AnalysisContext) -> tuple[float, bool]:
     return _sum(frame, "quantity"), estimated
 
 
+EVENT_SCHEMA = {
+    "sale_id": pl.String,
+    "date": pl.String,
+    "sku": pl.String,
+    "name": pl.String,
+    "category": pl.String,
+    "status": pl.String,
+    "quantity": pl.Float64,
+    "value": pl.Float64,
+    "price_known": pl.Boolean,
+}
+
+
+def _sale_events(context: AnalysisContext) -> tuple[pl.DataFrame, bool, list[str]]:
+    """WB sales are observed sale/return events, independent of order creation dates."""
+    source = getattr(context.snapshot, "sales", [])
+    complete = _source_complete(context, "sales", bool(source))
+    catalog = _catalog(context)
+    rows = []
+    warnings = []
+    seen = set()
+    for i, event in enumerate(source):
+        observed = _date(event.get("date"))
+        status = str(event.get("status", "")).lower()
+        quantity = _num(event.get("quantity"))
+        if observed is None or quantity <= 0 or status not in (DELIVERED | RETURNED):
+            warnings.append(
+                "События продаж без корректной даты, количества или статуса пропущены; итоги неполные."
+            )
+            complete = False
+            continue
+        if not context.period.start <= observed <= context.period.end:
+            continue
+        sale_id = str(event.get("sale_id") or f"event-{i}")
+        if sale_id in seen:
+            warnings.append("Повторяющиеся идентификаторы событий продаж исключены.")
+            continue
+        seen.add(sale_id)
+        product = catalog.get(_key(event), {})
+        category = str(
+            product.get("category")
+            or product.get("category_name")
+            or event.get("category")
+            or "Без категории"
+        )
+        raw_price = event.get("sale_price", event.get("price"))
+        known = _valid(raw_price) and _num(raw_price) >= 0
+        if not known:
+            warnings.append(
+                "Часть цен выкупов/возвратов отсутствует; денежные итоги событий неполные."
+            )
+        rows.append(
+            {
+                "sale_id": sale_id,
+                "date": observed.isoformat(),
+                "sku": _canonical_key(event, catalog),
+                "name": str(event.get("name") or product.get("name") or _key(event)),
+                "category": category,
+                "status": "delivered" if status in DELIVERED else "returned",
+                "quantity": quantity,
+                "value": _num(raw_price) * quantity if known else 0,
+                "price_known": known,
+            }
+        )
+    if not complete:
+        warnings.append(
+            "Источник продаж Wildberries недоступен или неполон; отсутствие событий не означает нулевые выкупы и возвраты."
+        )
+    return _frame(rows, EVENT_SCHEMA), complete, list(dict.fromkeys(warnings))
+
+
+def _wb_sales(context: AnalysisContext) -> Report:
+    orders, posts, warnings = _postings(context)
+    events, complete, event_warnings = _sale_events(context)
+    warnings += event_warnings
+    orders_complete = _source_complete(context, "orders", bool(posts))
+    orders_observed = orders_complete or bool(posts)
+    sales_observed = complete or not events.is_empty()
+    if not orders_observed and not sales_observed:
+        return _report(
+            context,
+            "Продажи",
+            ["Источники заказов и продаж Wildberries недоступны за выбранный период."],
+            {
+                "available": False,
+                "orders": None,
+                "delivered_units": None,
+                "returned_units": None,
+                "average_basket": None,
+            },
+            warnings,
+        )
+    delivered = events.filter(pl.col("status") == "delivered")
+    returned = events.filter(pl.col("status") == "returned")
+    units = _sum(delivered, "quantity") if complete or not delivered.is_empty() else None
+    returned_units = _sum(returned, "quantity") if complete or not returned.is_empty() else None
+    delivered_value = (
+        _sum(delivered, "value") if units is not None and delivered["price_known"].all() else None
+    )
+    returned_value = (
+        _sum(returned, "value")
+        if returned_units is not None and returned["price_known"].all()
+        else None
+    )
+    average_price = (
+        _ratio(delivered_value, units)
+        if delivered_value is not None and units is not None
+        else None
+    )
+    statuses = [str(post.get("status", "unknown")).lower() for post in posts]
+    cancelled = sum(status in CANCELLED for status in statuses) if orders_observed else None
+    order_daily = orders.group_by("date").agg(pl.col("posting").n_unique().alias("orders"))
+    sale_daily = events.group_by("date").agg(
+        pl.col("quantity").filter(pl.col("status") == "delivered").sum().alias("delivered_units"),
+        pl.col("quantity").filter(pl.col("status") == "returned").sum().alias("returned_units"),
+    )
+    daily_frame = order_daily.join(sale_daily, on="date", how="full", coalesce=True)
+    for column, known in (
+        ("orders", orders_complete),
+        ("delivered_units", complete),
+        ("returned_units", complete),
+    ):
+        if known:
+            daily_frame = daily_frame.with_columns(pl.col(column).fill_null(0))
+    daily = daily_frame.sort("date").to_dicts()
+    order_count = len(posts) if orders_observed else None
+    lines = [
+        f"Заказов: {order_count if order_count is not None else 'нет данных'}; отменённых: {cancelled if cancelled is not None else 'нет данных'}",
+        f"Выкуплено товаров по дате продажи: {f'{units:g}' if units is not None else 'нет данных'}",
+        f"Возвраты по дате возврата: {f'{returned_units:g}' if returned_units is not None else 'нет данных'}",
+        f"Выручка выкупов: {_money(delivered_value)}; возвраты: {_money(returned_value)}",
+        f"Средняя цена выкупленного товара: {_money(average_price)}",
+        "Динамика (заказы — дата заказа; выкупы/возвраты — дата события):",
+    ]
+    for row in daily[-10:]:
+        lines.append(
+            f"{row['date']}: заказов {row['orders'] if row['orders'] is not None else 'н/д'}; выкуплено {row['delivered_units'] if row['delivered_units'] is not None else 'н/д'}; возвратов {row['returned_units'] if row['returned_units'] is not None else 'н/д'}"
+        )
+    warnings.append(
+        "Заказы и продажи — разные события и выборки. По строкам Statistics API нельзя восстановить общую корзину покупателя: средний чек корзины не рассчитывается; показана средняя цена товара."
+    )
+    if not orders_complete:
+        warnings.append(
+            "История заказов недоступна или неполна; число заказов и отмен не является итогом полного периода."
+        )
+    return _report(
+        context,
+        "Продажи",
+        lines,
+        {
+            "available": True,
+            "orders": order_count,
+            "cancelled_orders": cancelled,
+            "delivered_orders": None,
+            "delivered_events": delivered.height if sales_observed else None,
+            "delivered_units": units,
+            "returned_units": returned_units,
+            "delivered_value": delivered_value,
+            "returned_value": returned_value,
+            "average_basket": None,
+            "average_unit_price": average_price,
+            "daily": daily,
+            "sales_complete": complete,
+            "orders_complete": orders_complete,
+            "sales_basis": "event_date",
+        },
+        warnings,
+    )
+
+
 def _sales(context: AnalysisContext) -> Report:
+    if _is_wb(context):
+        return _wb_sales(context)
     frame, posts, warnings = _postings(context)
     if not posts:
         return _report(
@@ -546,7 +748,11 @@ def _ads(context: AnalysisContext) -> Report:
         return _report(
             context,
             "Реклама",
-            ["Подключите Ozon Performance API или импортируйте CSV со статистикой рекламы."],
+            [
+                "Подключите "
+                + ("API рекламы Wildberries" if _is_wb(context) else "Ozon Performance API")
+                + " или импортируйте CSV со статистикой рекламы."
+            ],
             {"available": False, "drr": None},
         )
     frame = _frame(
@@ -625,9 +831,13 @@ def _ads(context: AnalysisContext) -> Report:
 
 def _seo(context: AnalysisContext, page: int) -> Report:
     catalog = _catalog(context)
+    content_unavailable = (
+        _is_wb(context) and getattr(context.snapshot, "sources", {}).get("products") is False
+    )
     rows: dict[str, dict] = {}
-    for product in context.snapshot.products:
-        rows[_canonical_key(product, catalog)] = dict(product)
+    if not content_unavailable:
+        for product in context.snapshot.products:
+            rows[_canonical_key(product, catalog)] = dict(product)
     for imported in sorted(context.seo, key=lambda row: str(row.get("date", ""))):
         observed = _date(imported.get("date"))
         if observed and observed > context.period.end:
@@ -638,7 +848,11 @@ def _seo(context: AnalysisContext, page: int) -> Report:
         return _report(
             context,
             "SEO",
-            ["Карточки товаров не загружены. Для позиций и ключевых слов импортируйте SEO CSV."],
+            [
+                "Карточки Wildberries не загружены. Разрешите токену доступ «Контент» или импортируйте SEO CSV с названиями и описаниями."
+                if content_unavailable
+                else "Карточки товаров не загружены. Для позиций и ключевых слов импортируйте SEO CSV."
+            ],
             {"available": False},
         )
     assessed = []
@@ -727,13 +941,19 @@ def _seo(context: AnalysisContext, page: int) -> Report:
             "pages": pages,
             "products": assessed,
             "card_count": len(assessed),
+            "audit_source": "csv_only" if content_unavailable else "catalog_and_csv",
             "ranks_available": frame.filter(pl.col("rank_known")).height,
         },
         [
-            "Проверки названия — эвристики, не гарантии ранжирования. Seller API не сообщает поисковые запросы и позиции; они доступны только из загруженных данных.",
+            f"Проверки названия — эвристики, не гарантии ранжирования. Подключённые API {_marketplace(context)} не сообщают поисковые запросы и позиции; они доступны только из загруженных данных.",
             "Ключи проверяются по буквальным словам без морфологии; включайте только релевантные запросы, избегайте повторов и переспама.",
             "Не переданное описание/фото не означает пустую карточку.",
-        ],
+        ]
+        + (
+            ["Доступ к «Контенту» Wildberries отсутствует; проверены только карточки из SEO CSV."]
+            if content_unavailable
+            else []
+        ),
     )
 
 
@@ -748,7 +968,7 @@ def _competitors(context: AnalysisContext, page: int) -> Report:
             context,
             "Конкуренты",
             [
-                "Импортируйте CSV наблюдений: sku, competitor_sku, price, rating, reviews, position, date. Seller API не предоставляет данные конкурентов."
+                f"Импортируйте CSV наблюдений: sku, competitor_sku, price, rating, reviews, position, date. Подключённые API {_marketplace(context)} не предоставляют данные конкурентов."
             ],
             {"available": False},
         )
@@ -869,12 +1089,15 @@ def _stock_rows(context: AnalysisContext) -> tuple[pl.DataFrame, list[str]]:
             )
             present = max(_num(raw_present), 0)
             reserved = max(_num(stock.get("reserved")), 0)
+            reserved_known = bool(
+                stock.get("reserved_known", product.get("reserved_known", not _is_wb(context)))
+            )
             if not _valid(raw_present) or (
                 stock.get("reserved") is not None and not _valid(stock["reserved"])
             ):
                 warnings.append("Некорректные остатки не учтены; покрытие неполное.")
                 continue
-            if reserved > present:
+            if reserved_known and reserved > present:
                 warnings.append(
                     "Резерв превышает остаток у части товаров; доступный остаток принят равным 0."
                 )
@@ -883,8 +1106,9 @@ def _stock_rows(context: AnalysisContext) -> tuple[pl.DataFrame, list[str]]:
                     "sku": sku,
                     "name": str(details.get("name") or product.get("name") or sku),
                     "present": present,
-                    "reserved": reserved,
-                    "available": max(present - reserved, 0),
+                    "reserved": reserved if reserved_known else None,
+                    "reserved_known": reserved_known,
+                    "available": max(present - reserved, 0) if reserved_known else present,
                 }
             )
     frame = _frame(
@@ -894,13 +1118,18 @@ def _stock_rows(context: AnalysisContext) -> tuple[pl.DataFrame, list[str]]:
             "name": pl.String,
             "present": pl.Float64,
             "reserved": pl.Float64,
+            "reserved_known": pl.Boolean,
             "available": pl.Float64,
         },
     )
     return frame.group_by("sku").agg(
         pl.col("name").first(),
         pl.col("present").sum(),
-        pl.col("reserved").sum(),
+        pl.when(pl.col("reserved_known").all())
+        .then(pl.col("reserved").sum())
+        .otherwise(None)
+        .alias("reserved"),
+        pl.col("reserved_known").all(),
         pl.col("available").sum(),
     ), list(dict.fromkeys(warnings))
 
@@ -911,16 +1140,31 @@ def _stocks(context: AnalysisContext, page: int) -> Report:
         return _report(
             context, "Остатки", ["Остатки не загружены."], {"available": False}, warnings
         )
-    postings, _, post_warnings = _postings(context)
-    warnings += post_warnings
-    demand = (
-        postings.filter(pl.col("status").is_in(DELIVERED))
-        .group_by("sku")
-        .agg(pl.col("quantity").sum().alias("sold_units"))
-    )
+    demand_complete = True
+    if _is_wb(context):
+        events, demand_complete, event_warnings = _sale_events(context)
+        warnings += event_warnings
+        demand = events.group_by("sku").agg(
+            pl.when(pl.col("status") == "returned")
+            .then(-pl.col("quantity"))
+            .otherwise(pl.col("quantity"))
+            .sum()
+            .clip(lower_bound=0)
+            .alias("sold_units")
+        )
+    else:
+        postings, _, post_warnings = _postings(context)
+        warnings += post_warnings
+        demand = (
+            postings.filter(pl.col("status").is_in(DELIVERED))
+            .group_by("sku")
+            .agg(pl.col("quantity").sum().alias("sold_units"))
+        )
     joined = stock.join(demand, on="sku", how="left").with_columns(
         pl.col("sold_units").fill_null(0)
     )
+    if not demand_complete:
+        joined = joined.with_columns(pl.lit(None, dtype=pl.Float64).alias("sold_units"))
     days = max((context.period.end - context.period.start).days + 1, 1)
     joined = joined.with_columns((pl.col("sold_units") / days).alias("daily_demand"))
     joined = joined.with_columns(
@@ -934,7 +1178,9 @@ def _stocks(context: AnalysisContext, page: int) -> Report:
         .alias("recommended_supply"),
     )
     joined = joined.with_columns(
-        pl.when((pl.col("daily_demand") > 0) & (pl.col("days_cover") < 14))
+        pl.when(pl.col("daily_demand").is_null())
+        .then(pl.lit("Недостаточно данных о продажах"))
+        .when((pl.col("daily_demand") > 0) & (pl.col("days_cover") < 14))
         .then(pl.lit("Дефицит"))
         .when(
             (pl.col("days_cover") > 60) | ((pl.col("sold_units") == 0) & (pl.col("available") > 0))
@@ -946,21 +1192,34 @@ def _stocks(context: AnalysisContext, page: int) -> Report:
     rows = joined.sort(["recommended_supply", "available"], descending=[True, True]).to_dicts()
     pages = max(math.ceil(len(rows) / PAGE_SIZE), 1)
     page = max(0, min(page, pages - 1))
+    reserved_known = stock["reserved_known"].all()
+    reserve_text = f"{_sum(stock, 'reserved'):g} шт." if reserved_known else "не передан API"
     lines = [
-        f"Товаров: {len(rows)}; доступно {_sum(stock, 'available'):g} шт.; резерв {_sum(stock, 'reserved'):g} шт.",
+        f"Товаров: {len(rows)}; доступно {_sum(stock, 'available'):g} шт.; резерв {reserve_text}",
         f"Страница {page + 1}/{pages}; ориентир поставки — запас на 30 дней",
     ]
     for row in rows[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]:
         cover = (
             f"{row['days_cover']:.1f} дней"
             if row["days_cover"] is not None
+            else "нет данных о спросе"
+            if row["daily_demand"] is None
             else "нет наблюдаемого спроса"
         )
+        supply = (
+            f"{row['recommended_supply']:g} шт."
+            if row["recommended_supply"] is not None
+            else "нет данных"
+        )
         lines.append(
-            f"{row['name'][:55]} (SKU {row['sku']}): {row['available']:g} шт.; {cover}; {row['status']}; поставить {row['recommended_supply']:g} шт."
+            f"{row['name'][:55]} (SKU {row['sku']}): {row['available']:g} шт.; {cover}; {row['status']}; поставить {supply}"
         )
     warnings += [
-        "Доступно = present − reserved (не менее 0). Оборачиваемость оценена по текущему остатку и выкупам созданных в период отправлений.",
+        (
+            "WB quantity уже является доступным остатком; товары в пути к клиенту или от клиента не вычитаются как резерв. Резерв отдельно не передан. Спрос — выкупы минус возвраты по датам событий, не менее 0."
+            if _is_wb(context)
+            else "Доступно = present − reserved (не менее 0). Оборачиваемость оценена по текущему остатку и выкупам созданных в период отправлений."
+        ),
         "Дефицит: менее 14 дней, излишек: более 60 дней или нет выкупов. Прогноз не учитывает срок поставки, сезонность, ожидаемые поступления и неполную историю.",
     ]
     return _report(
@@ -973,17 +1232,124 @@ def _stocks(context: AnalysisContext, page: int) -> Report:
             "pages": pages,
             "products": rows,
             "available_units": _sum(stock, "available"),
-            "reserved_units": _sum(stock, "reserved"),
-            "shortage_count": joined.filter(pl.col("status") == "Дефицит").height,
+            "reserved_units": _sum(stock, "reserved") if reserved_known else None,
+            "sales_complete": demand_complete,
+            "shortage_count": joined.filter(pl.col("status") == "Дефицит").height
+            if demand_complete
+            else None,
             "excess_count": joined.filter(
                 pl.col("status") == "Излишек/нет наблюдаемых продаж"
-            ).height,
+            ).height
+            if demand_complete
+            else None,
+        },
+        warnings,
+    )
+
+
+def _wb_categories(context: AnalysisContext, page: int) -> Report:
+    orders, posts, warnings = _postings(context)
+    events, sales_complete, sale_warnings = _sale_events(context)
+    warnings += sale_warnings
+    orders_complete = _source_complete(context, "orders", bool(posts))
+    if orders.is_empty() and events.is_empty() and not orders_complete and not sales_complete:
+        return _report(
+            context,
+            "Категории",
+            ["Данные заказов и продаж за период не получены."],
+            {"available": False},
+            warnings,
+        )
+    ordered = orders.group_by("category").agg(
+        pl.col("posting").n_unique().alias("orders"),
+        pl.col("quantity").sum().alias("ordered_units"),
+        pl.col("value").sum().alias("ordered_turnover"),
+        pl.col("price_known").all().alias("order_prices_complete"),
+    )
+    sold = events.group_by("category").agg(
+        pl.col("quantity").filter(pl.col("status") == "delivered").sum().alias("buyouts"),
+        pl.col("quantity").filter(pl.col("status") == "returned").sum().alias("returns"),
+        pl.col("value").filter(pl.col("status") == "delivered").sum().alias("buyout_revenue"),
+        pl.col("value").filter(pl.col("status") == "returned").sum().alias("return_revenue"),
+        pl.col("price_known").all().alias("sale_prices_complete"),
+    )
+    aggregate = ordered.join(sold, on="category", how="full", coalesce=True)
+    order_columns = ("orders", "ordered_units", "ordered_turnover")
+    sale_columns = ("buyouts", "returns", "buyout_revenue", "return_revenue")
+    for column in (*order_columns, *sale_columns):
+        if orders_complete if column in order_columns else sales_complete:
+            aggregate = aggregate.with_columns(pl.col(column).fill_null(0))
+    aggregate = aggregate.with_columns(
+        pl.when(pl.col("order_prices_complete").not_())
+        .then(None)
+        .otherwise(pl.col("ordered_turnover"))
+        .alias("ordered_turnover"),
+        *[
+            pl.when(pl.col("sale_prices_complete").not_())
+            .then(None)
+            .otherwise(pl.col(column))
+            .alias(column)
+            for column in ("buyout_revenue", "return_revenue")
+        ],
+    )
+    aggregate = aggregate.with_columns(
+        (pl.col("buyout_revenue") - pl.col("return_revenue")).alias("net_realized_turnover")
+    )
+    rows = aggregate.sort(
+        ["buyout_revenue", "category"], descending=[True, False], nulls_last=True
+    ).to_dicts()
+    pages = max(math.ceil(len(rows) / PAGE_SIZE), 1)
+    page = max(0, min(page, pages - 1))
+    lines = [f"Категорий: {len(rows)} · страница {page + 1}/{pages}"]
+    for row in rows[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]:
+        orders_text = str(row["orders"]) if row["orders"] is not None else "нет данных"
+        buyouts = f"{row['buyouts']:g}" if row["buyouts"] is not None else "нет данных"
+        returns = f"{row['returns']:g}" if row["returns"] is not None else "нет данных"
+        lines.append(
+            f"{row['category']}: заказов {orders_text}; выкуплено {buyouts} шт.; возвратов {returns} шт.; оборот заказов {_money(row['ordered_turnover'])}; выкупы {_money(row['buyout_revenue'])}; после возвратов {_money(row['net_realized_turnover'])}"
+        )
+    warnings += [
+        "Заказы сгруппированы по дате заказа, выкупы и возвраты — по дате фактического события. Отменённые заказы входят в оборот заказов и не считаются возвратами.",
+        "Денежный оборот — цена события × количество; комиссия, логистика, налоги и прочие удержания сюда не входят. Начисления и выплаты WB смотрите в финансах.",
+    ]
+    if not orders_complete:
+        warnings.append(
+            "Источник заказов недоступен или неполон; отсутствующие количества не заменяются нулями."
+        )
+    if any(row["category"] == "Без категории" for row in rows):
+        warnings.append(
+            "Не для всех SKU известна категория: такие товары объединены в «Без категории»."
+        )
+    return _report(
+        context,
+        "Категории",
+        lines,
+        {
+            "available": True,
+            "page": page,
+            "pages": pages,
+            "categories": rows,
+            "page_categories": rows[page * PAGE_SIZE : (page + 1) * PAGE_SIZE],
+            "ordered_turnover": _sum(aggregate, "ordered_turnover")
+            if orders_complete and aggregate["ordered_turnover"].null_count() == 0
+            else None,
+            "buyout_revenue": _sum(aggregate, "buyout_revenue")
+            if sales_complete and aggregate["buyout_revenue"].null_count() == 0
+            else None,
+            "net_realized_turnover": _sum(aggregate, "net_realized_turnover")
+            if sales_complete and aggregate["net_realized_turnover"].null_count() == 0
+            else None,
+            "orders_complete": orders_complete,
+            "sales_complete": sales_complete,
+            "sales_basis": "event_date",
         },
         warnings,
     )
 
 
 def _categories(context: AnalysisContext, page: int) -> Report:
+    if _is_wb(context):
+        return _wb_categories(context, page)
     frame, _, warnings = _postings(context)
     if frame.is_empty():
         return _report(
